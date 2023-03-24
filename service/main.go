@@ -179,6 +179,6 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*") //任何脚本位置
+	w.Header().Set("Access-Control-Allow-Origin", "*") //前端访问任何脚本位置
 	w.Write(js)
 }
