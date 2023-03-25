@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"reflect"
 	"strconv"
+	"strings"
 
+	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
 	"gopkg.in/olivere/elastic.v7"
 )
@@ -25,13 +28,15 @@ type Post struct {
 	User     string   `json:"user"`
 	Message  string   `json:"message"`
 	Location Location `json:"location"`
+	Url      string   `json: "url`
 }
 
 const (
-	INDEX    = "around" // 应用名字，找数据用
-	TYPE     = "post"
-	DISTANCE = "200km"
-	ES_URL   = "http://34.27.222.128:9200"
+	INDEX       = "around" // 应用名字，找数据用
+	TYPE        = "post"
+	DISTANCE    = "200km"
+	ES_URL      = "http://34.27.222.128:9200"
+	BUCKET_NAME = "post-images-381306"
 )
 
 func main() {
@@ -86,23 +91,82 @@ func main() {
 // 用户提交的数据，r， string
 // 改w的副本，带星外面也变
 func handlerPost(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Received one post request")
-	// to post go
-	decoder := json.NewDecoder(r.Body)
-	var p Post
-	// if两个statement，初始化+做判断
-	// 直接编辑p地址的值
-	// request获得json string
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Aloow-Headers", "Content-Type, Authorization")
 
-	if err := decoder.Decode(&p); err != nil {
+	r.ParseMultipartForm(32 << 20) // max memory: 32M
+
+	// Parse form data
+	fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+
+	p := &Post{
+		User:    "1111",
+		Message: r.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
+	}
+
+	// create unique string
+	id := (uuid.New()).String()
+
+	// read image file
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v\n", err)
+		panic(err)
+	}
+	defer file.Close()
+
+	ctx := context.Background()
+
+	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+	if err != nil {
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v\n", err)
 		panic(err)
 	}
 
-	fmt.Fprintf(w, "Post received: %s\n", p.Message)
-	// create unique string
-	id := (uuid.New()).String()
+	p.Url = attrs.MediaLink
+
 	// save to ES
-	saveToES(&p, id)
+	saveToES(p, id)
+}
+
+func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	// create a clent
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// create a bucket instance
+	bucket := client.Bucket(bucketName)
+
+	if _, err := bucket.Attrs(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	obj := bucket.Object(name)
+	wc := obj.NewWriter(ctx)
+	if _, err = io.Copy(wc, r); err != nil {
+		return nil, nil, err
+	}
+	if err := wc.Close(); err != nil {
+		return nil, nil, err
+	}
+
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		return nil, nil, err
+	}
+
+	attrs, err := obj.Attrs(ctx)
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+	return obj, attrs, err
 }
 
 func saveToES(p *Post, id string) {
@@ -171,7 +235,10 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 		p := item.(Post) // p = (Post)item 类型转换
 		fmt.Printf("Post by %s: %s at lat %v and lon %v \n",
 			p.User, p.Message, p.Location.Lat, p.Location.Lon)
-		ps = append(ps, p)
+		// perform filtering based on key words such as web spam etc
+		if !containsFilteredWords(&p.Message) {
+			ps = append(ps, p)
+		}
 	}
 
 	js, err := json.Marshal(ps)
@@ -181,4 +248,17 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*") //前端访问任何脚本位置
 	w.Write(js)
+}
+
+func containsFilteredWords(s *string) bool {
+	filteredWords := []string{
+		"hehe",
+		"xxxx",
+	}
+	for _, word := range filteredWords {
+		if strings.Contains(*s, word) {
+			return true
+		}
+	}
+	return false
 }
