@@ -12,7 +12,11 @@ import (
 	"strings"
 
 	"cloud.google.com/go/storage"
+	jwtmiddleware "github.com/auth0/go-jwt-middleware"
+	"github.com/auth0/go-jwt-middleware/validator"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 	"gopkg.in/olivere/elastic.v7"
 )
 
@@ -28,7 +32,7 @@ type Post struct {
 	User     string   `json:"user"`
 	Message  string   `json:"message"`
 	Location Location `json:"location"`
-	Url      string   `json: "url`
+	Url      string   `json:"url"`
 }
 
 const (
@@ -39,6 +43,8 @@ const (
 	BUCKET_NAME = "post-images-381306"
 )
 
+var mySigningKey = []byte("secret")
+
 func main() {
 	// create a client client handle
 	// sniff 回调函数
@@ -46,7 +52,6 @@ func main() {
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
 		panic(err)
-		return
 	}
 	// use IndexExists service to check if a specified index exists
 	ctx := context.Background()
@@ -73,8 +78,35 @@ func main() {
 		}
 	}
 	fmt.Println("started-service")
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
+
+	r := mux.NewRouter()
+
+	keyFunc := func(ctx context.Context) (interface{}, error) {
+		// Our token must be signed using this data.
+		return mySigningKey, nil
+	}
+	// Set up the validator.
+	jwtValidator, err := validator.New(
+		keyFunc,
+		validator.HS256,
+		"https://<issuer-url>/",
+		[]string{"<audience>"},
+	)
+	if err != nil {
+		log.Fatalf("failed to set up the validator: %v", err)
+	}
+
+	// Set up the middleware.
+	jwtMiddleware := jwtmiddleware.New(jwtValidator.ValidateToken)
+
+	// http.HandlerFunc("/post", handlerPost)
+	// jwtMiddleware验证用户提交token和key是否一致
+	r.Handle("/post", jwtMiddleware.CheckJWT(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search", jwtMiddleware.CheckJWT(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+
+	http.Handle("/", r)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -95,6 +127,10 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Aloow-Headers", "Content-Type, Authorization")
 
+	user := r.Context().Value("user")
+	claims := user.(*jwt.Token).Claims
+	username := claims.(jwt.MapClaims)["username"]
+
 	r.ParseMultipartForm(32 << 20) // max memory: 32M
 
 	// Parse form data
@@ -103,7 +139,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
 
 	p := &Post{
-		User:    "1111",
+		User:    username.(string),
 		Message: r.FormValue("message"),
 		Location: Location{
 			Lat: lat,
@@ -117,14 +153,13 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// read image file
 	file, _, err := r.FormFile("image")
 	if err != nil {
-		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
-		fmt.Printf("GCS is not setup %v\n", err)
+		http.Error(w, "Image is not available", http.StatusInternalServerError)
+		fmt.Printf("Image is not available %v\n", err)
 		panic(err)
 	}
 	defer file.Close()
 
 	ctx := context.Background()
-
 	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
 	if err != nil {
 		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
@@ -208,7 +243,6 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
 	if err != nil {
 		panic(err)
-		return
 	}
 
 	// 进行搜索
@@ -225,7 +259,7 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 
-	fmt.Println("Query took %d milliseconds\n", searchResult.TookInMillis)
+	fmt.Printf("Query took %v milliseconds\n", searchResult.TookInMillis)
 	fmt.Printf("Found a total of %d posts \n", searchResult.TotalHits())
 
 	// searchResult返回Post类型,reflection
